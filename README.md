@@ -84,6 +84,98 @@ universe structure, impredicative `Prop`, `imax`), these inductive types, and
 required. Definitions and inductive declarations are public; definitions are
 transparent; theorem bodies are private.
 
+## How inductive types work in zero knowledge
+
+A zk-SNARK circuit has a fixed shape, but a type checker recurses, branches and
+normalises for as long as it needs. zkLean bridges this gap by having the prover
+run a *certifying* checker. The checker writes every step of the typing
+derivation as a row in a few flat tables, and each row can be checked by
+looking at a constant number of earlier rows. The circuit only checks these
+rows; it never searches. Inductive types had to fit that pattern. They put
+pressure on it in three places: checking a declaration (positivity, universes,
+which elimination is allowed), typing `Nat.rec` without universe polymorphism,
+and ι-reduction, whose redex has two argument lists of unbounded length. Four
+ideas made it work.
+
+**1. Declarations are public, so they are checked outside the circuit.** A
+theorem about `Nat` is meaningless unless the verifier knows what `Nat` is, so
+inductive declarations are part of the public statement. The verifier
+elaborates them itself (`kernel/inductive.go`) with Lean's checks:
+well-typedness, parameters passed through unchanged, strict positivity, field
+universes, and large elimination from `Prop` only for subsingletons.
+Elaboration produces a **constant table** holding each constant's type and
+each constructor's ι-rule. The table is a public input of the circuit, built
+deterministically by both prover and verifier from the same public text. All
+the hard, non-local analysis runs natively, on public data. The circuit only
+*uses* the table. Editing a declaration, even reordering `Bool`'s constructors,
+changes the public inputs and invalidates the proof.
+
+**2. Constants are table lookups, and a recursor's universe is a
+substitution.** A constant is a new leaf `Const(k, u)` in the term DAG, and
+typing it is one judgment row plus one row of the existing substitution table:
+`c.{u} : Type(c)[BVar 0 := Sort u]`. The kernel has no universe polymorphism,
+so a recursor's type is stored as a template in which `BVar 0` stands for the
+motive's universe `Sort u`, and the level is written in the source:
+`Nat.rec.{0}` to prove by induction, `Nat.rec.{1}` to compute into `Type`.
+
+**3. Each ι-rule is one closed term.** Instead of pattern matching in the
+circuit, each constructor stores a closed right-hand side in which the
+recursor is an argument `r`:
+
+```
+Rhs_succ = fun r P z s n => s n (r P z s n)
+Nat.rec P z s (Nat.succ n)  ≡ι  Rhs_succ Nat.rec P z s n   -- then plain β-steps
+```
+
+The remaining β-reductions use rows the circuit already checks. Passing the
+recursor in as `r` keeps one public `Rhs` valid at every universe level. As in
+Lean's kernel, the rule ignores the constructor's copy of the parameters and
+the recursor's indices. Untyped β plus these rules is an orthogonal rewrite
+system, so it is confluent.
+
+**4. Argument lists are walked one row at a time.** An ι-step relates
+`U = rec a₁ … a_NRec`, `M = c b₁ … b_NCA` and
+`W = Rhs_c rec a₁ … a_NPre b_{NCP+1} … b_NCA`. `W` keeps the parameters,
+motive and minor premises but drops the indices, and keeps the constructor's
+fields but drops its parameters. Both lists can be any length, so a new
+**iota-walk table** builds `U`, `M` and `W` together, one argument per row.
+Each row is either a base (`U = rec` or `M = c`) or a step that extends the
+previous row by one argument. A `keep` bit decides whether the argument is
+also appended to `W`. Range checks pin `keep` in both directions
+(`keep ⇔ N < NPre` for the recursor's arguments, `keep ⇔ N ≥ NCP` for the
+constructor's), so the prover cannot drop or insert an argument. A conversion
+row then points at a finished walk and concludes `App(U, M) ≡ W`. For
+`Nat.rec P z s (Nat.succ k)` the walk has six rows:
+
+| # | kind | U | M | W |
+|---|---|---|---|---|
+| 0 | rec base | `rec` | | `Rhs rec` |
+| 1–3 | rec args (kept) | `rec P`, `rec P z`, `rec P z s` | | `Rhs rec P`, …, `Rhs rec P z s` |
+| 4 | ctor base | `rec P z s` | `succ` | `Rhs rec P z s` |
+| 5 | ctor arg (kept) | `rec P z s` | `succ k` | `Rhs rec P z s k` |
+
+**Soundness.** The argument is by induction on row index, since every reference
+points backwards. Every walk describes real argument lists, so every ι-row is
+a genuine instance of the declaration's ι-rule. Every judgment row is then an
+instance of a typing rule of the Calculus of Constructions extended with the
+public constants. Because the declarations passed Lean's checks, this is the
+fragment of the Calculus of Inductive Constructions that Lean's kernel
+implements, without mutual or nested types, which is consistent. The native
+relation (`kernel/relation.go`) and the circuit (`circuit/circuit.go`) are
+written in lockstep. Tests check three things: the circuit never accepts what
+the relation rejects; targeted forgeries are rejected (a bogus ι result, an
+unfinished walk, a dropped argument, a switched constructor, a constant at the
+wrong type, a recursor at the wrong universe); and randomly corrupted
+certificates either fail or still encode a valid proof.
+
+**Cost.** Proofs are still 196 bytes and verify in a few milliseconds. The
+public constant table raised the public-input count to between 1,026 and 2,050,
+depending on the profile. The default circuit grew from 396k to 470k
+constraints. Induction proofs such as `add_comm` produce large certificates
+because the prover normalises terms fully, hence the opt-in `large` profile.
+Lazy weak-head reduction in the prover would shrink them without changing the
+circuit. See `DESIGN.md` for the full design.
+
 ## Layout
 
 | path | contents |
