@@ -35,14 +35,15 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 		return 0
 	}
 	if len(T) != sz.NT || len(c.Ctx) != sz.NX || len(c.Look) != sz.NL || len(c.Inst) != sz.NI ||
-		len(c.Conv) != sz.NC || len(c.Jud) != sz.NJ {
+		len(c.Conv) != sz.NC || len(c.Jud) != sz.NJ || len(s.Consts) != sz.NK || len(c.Iota) != sz.NW {
 		return fmt.Errorf("certificate not padded to sizes")
 	}
+	K := s.Consts // public
 	inT := func(i int) bool { return i >= 0 && i < sz.NT }
 
 	// ---- terms ----
 	for i, n := range T {
-		if n.Tag < 0 || n.Tag > 5 {
+		if n.Tag < 0 || n.Tag >= NumTags {
 			fail("term %d: bad tag", i)
 			continue
 		}
@@ -119,7 +120,7 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 			continue
 		}
 		switch n.Tag {
-		case TSort, TFVar:
+		case TSort, TFVar, TConst:
 			if r.R != r.T {
 				return fmt.Errorf("inst %d: atom", k)
 			}
@@ -143,6 +144,47 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 			}
 		}
 	}
+	// ---- iota walks ----
+	W := c.Iota
+	for k, r := range W {
+		if r.Kind < 0 || r.Kind >= NumWKinds || !inT(r.U) || !inT(r.M) || !inT(r.W) || !rng(r.N) ||
+			!(r.Keep == 0 || r.Keep == 1) {
+			return fmt.Errorf("iota %d malformed", k)
+		}
+		if r.Kind == WPad {
+			continue
+		}
+		kr := K[r.Ctor]
+		u, m, w := T[r.U], T[r.M], T[r.W]
+		ok := true
+		if r.Kind == WRecBase {
+			ok = kr.Ctor == 1 && u.Tag == TConst && u.A == kr.Rec && w.Tag == TApp && w.A == kr.Rhs && w.B == r.U && r.N == 0
+		} else {
+			if !(r.Prev >= 0 && r.Prev < k) {
+				return fmt.Errorf("iota %d: prev must precede", k)
+			}
+			p := W[r.Prev]
+			ok = p.Ctor == r.Ctor
+			// keep ⇔ argument N goes into the right-hand side
+			keepW := (w.Tag == TApp && w.A == p.W) && r.Keep == 1 || r.W == p.W && r.Keep == 0
+			switch r.Kind {
+			case WRecArg:
+				ok = ok && (p.Kind == WRecBase || p.Kind == WRecArg) && u.Tag == TApp && u.A == p.U && r.N == p.N+1 &&
+					(r.Keep == 1 && rng(kr.NPre-p.N-1) || r.Keep == 0 && rng(p.N-kr.NPre)) &&
+					keepW && (r.Keep == 0 || w.B == u.B)
+			case WCtorBase:
+				ok = ok && (p.Kind == WRecBase || p.Kind == WRecArg) && p.N == kr.NRec && r.U == p.U && r.W == p.W &&
+					m.Tag == TConst && m.A == r.Ctor && r.N == 0
+			case WCtorArg:
+				ok = ok && (p.Kind == WCtorBase || p.Kind == WCtorArg) && r.U == p.U && m.Tag == TApp && m.A == p.M &&
+					r.N == p.N+1 && (r.Keep == 1 && rng(p.N-kr.NCP) || r.Keep == 0 && rng(kr.NCP-p.N-1)) &&
+					keepW && (r.Keep == 0 || w.B == m.B)
+			}
+		}
+		if !ok {
+			return fmt.Errorf("iota %d (kind %d) invalid", k, r.Kind)
+		}
+	}
 	// ---- conversion ----
 	C := c.Conv
 	for k, r := range C {
@@ -153,7 +195,7 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 		if t1.G != 0 || t2.G != 0 {
 			return fmt.Errorf("conv %d: terms must be locally closed", k)
 		}
-		uses1 := r.Rule != CRefl && r.Rule != CBeta
+		uses1 := r.Rule != CRefl && r.Rule != CBeta && r.Rule != CIota
 		uses2 := uses1 && r.Rule != CSym
 		if uses1 && !(r.C1 >= 0 && r.C1 < k) || uses2 && !(r.C2 >= 0 && r.C2 < k) {
 			return fmt.Errorf("conv %d: children must precede", k)
@@ -183,6 +225,10 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 				c2.T1 == i1.R && c2.T2 == i2.R
 		case CApp:
 			ok = t1.Tag == TApp && t2.Tag == TApp && c1.T1 == t1.A && c1.T2 == t2.A && c2.T1 == t1.B && c2.T2 == t2.B
+		case CIota:
+			w := W[r.I1]
+			ok = (w.Kind == WCtorBase || w.Kind == WCtorArg) && w.N == K[w.Ctor].NCA &&
+				t1.Tag == TApp && t1.A == w.U && t1.B == w.M && r.T2 == w.W
 		}
 		if !ok {
 			return fmt.Errorf("conv %d (rule %d) invalid", k, r.Rule)
@@ -199,7 +245,7 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 		if !rng(d-sb.F) || !rng(d-ty.F) || sb.G != 0 || ty.G != 0 {
 			return fmt.Errorf("jud %d: terms not well-scoped", j)
 		}
-		uses := r.Rule >= JPi
+		uses := r.Rule == JPi || r.Rule == JLam || r.Rule == JApp || r.Rule == JConv
 		if uses && !(r.C1 >= 0 && r.C1 < j && r.C2 >= 0 && r.C2 < j) {
 			return fmt.Errorf("jud %d: children must precede", j)
 		}
@@ -234,6 +280,9 @@ func (c *Certificate) Relation(sz Sizes) (retErr error) {
 			ok = sb.Tag == TApp && c1.Ctx == r.Ctx && c1.Subj == sb.A && y1.Tag == TPi &&
 				c2.Ctx == r.Ctx && c2.Subj == sb.B && c2.Ty == y1.A &&
 				i1.T == y1.B && i1.K == 0 && i1.S == sb.B && i1.R == r.Ty
+		case JConst:
+			ok = sb.Tag == TConst && v.Tag == TSort && v.A == sb.B &&
+				i1.T == K[sb.A].Type && i1.K == 0 && i1.S == r.V && i1.R == r.Ty
 		case JConv:
 			cv := C[r.Cv]
 			ok = c1.Ctx == r.Ctx && c1.Subj == r.Subj && cv.T1 == c1.Ty && cv.T2 == r.Ty &&

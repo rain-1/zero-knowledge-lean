@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -46,8 +47,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   zklean check     FILE
   zklean statement FILE
-  zklean setup     [-profile small|default] [-keys DIR]
-  zklean prove     [-profile small|default] [-keys DIR] [-o OUT] FILE THEOREM
+  zklean setup     [-profile small|default|large] [-keys DIR]
+  zklean prove     [-profile small|default|large] [-keys DIR] [-o OUT] FILE THEOREM
   zklean verify    [-keys DIR] PUBLIC_FILE PROOF.zkp`)
 	os.Exit(2)
 }
@@ -59,7 +60,7 @@ func main() {
 	}
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-	profile := fs.String("profile", "default", "circuit capacity profile (small|default)")
+	profile := fs.String("profile", "default", "circuit capacity profile (small|default|large)")
 	keys := fs.String("keys", "keys", "directory holding circuit, proving and verifying keys")
 	out := fs.String("o", "", "output proof file (default THEOREM.zkp)")
 	// allow flags before and after positional arguments
@@ -140,11 +141,15 @@ func cmdCheck(path, profile string) {
 			ok = false
 			continue
 		}
+		if d.Kind == "inductive" {
+			fmt.Printf("✓ inductive %s  [%s]\n", d.Name, strings.Join(env.Constants(d.Name), ", "))
+			continue
+		}
 		if d.Value < 0 {
 			fmt.Printf("· %s %s : sorry\n", d.Kind, d.Name)
 			continue
 		}
-		c, err := kernel.Certify(env.S, d.Type, d.Value, sz.NP)
+		c, err := kernel.Certify(env.S, d.Type, d.Value, sz)
 		if err != nil {
 			fmt.Printf("✗ %s %s: %v\n", d.Kind, d.Name, err)
 			ok = false
@@ -242,7 +247,7 @@ func cmdProve(profile, dir, path, thm, out string) {
 		die("%s has no proof (sorry)", thm)
 	}
 	t0 := time.Now()
-	cert, err := kernel.Certify(env.S, d.Type, d.Value, sz.NP)
+	cert, err := kernel.Certify(env.S, d.Type, d.Value, sz)
 	if err != nil {
 		die("%s does not type-check:\n%v", thm, err)
 	}
@@ -270,7 +275,7 @@ func cmdProve(profile, dir, path, thm, out string) {
 	}
 	var buf bytes.Buffer
 	proof.WriteTo(&buf)
-	pf := proofFile{Format: "zklean-groth16-bn254-v1", Profile: profile, Sizes: sz, Theorem: thm,
+	pf := proofFile{Format: "zklean-groth16-bn254-v2", Profile: profile, Sizes: sz, Theorem: thm,
 		Proof: base64.StdEncoding.EncodeToString(buf.Bytes())}
 	js, _ := json.MarshalIndent(pf, "", "  ")
 	if err := os.WriteFile(out, append(js, '\n'), 0o644); err != nil {
@@ -285,7 +290,7 @@ func cmdVerify(dir, pubPath, proofPath string) {
 		die("%v", err)
 	}
 	var pf proofFile
-	if err := json.Unmarshal(raw, &pf); err != nil || pf.Format != "zklean-groth16-bn254-v1" {
+	if err := json.Unmarshal(raw, &pf); err != nil || pf.Format != "zklean-groth16-bn254-v2" {
 		die("%s: not a zklean proof", proofPath)
 	}
 	sz := sizes(pf.Profile)
@@ -297,7 +302,7 @@ func cmdVerify(dir, pubPath, proofPath string) {
 	if !ok || d.Kind != "theorem" {
 		die("public file has no theorem %q", pf.Theorem)
 	}
-	s, root, err := kernel.PublicLayout(env.S, d.Type, sz.NP, map[int]int{})
+	s, root, err := kernel.PublicLayout(env.S, d.Type, sz, map[int]int{})
 	if err != nil {
 		die("%v", err)
 	}

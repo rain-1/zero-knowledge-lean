@@ -4,8 +4,10 @@
 // (for ordering, freshness and universe comparisons) use gnark's
 // commitment-based range checker.
 //
-// Public inputs: the theorem statement's term rows (tag, a, b for rows
-// 0..NP-1) and the id of the statement. Everything else is private.
+// Public inputs: the public term rows (tag, a, b for rows 0..NP-1: the
+// constant table's terms and the theorem statement), the constant table
+// generated from the inductive declarations, and the id of the statement.
+// Everything else is private.
 package circuit
 
 import (
@@ -24,6 +26,8 @@ type Circuit struct {
 	PubB   []V `gnark:",public"`
 	Root   V   `gnark:",public"`
 
+	KType, KCtor, KRec, KRhs, KNPre, KNRec, KNCP, KNCA []V `gnark:",public"`
+
 	// ---- private ----
 	Tag, A, B []V // term rows NP..NT-1
 	F, G      []V // all NT term rows
@@ -37,6 +41,8 @@ type Circuit struct {
 	CRule, CT1, CT2, CC1, CC2, CI1, CI2, CV, CM []V
 
 	JRule, JCtx, JSubj, JTy, JC1, JC2, JI1, JI2, JX, JV, JL, JCv, JM []V
+
+	WKind, WCtor, WU, WM, WW, WN, WPrev, WKeep []V
 
 	Sz kernel.Sizes `gnark:"-"`
 }
@@ -58,6 +64,12 @@ func New(sz kernel.Sizes) *Circuit {
 	}
 	for _, p := range []*[]V{&c.JRule, &c.JCtx, &c.JSubj, &c.JTy, &c.JC1, &c.JC2, &c.JI1, &c.JI2, &c.JX, &c.JV, &c.JL, &c.JCv, &c.JM} {
 		*p = mk(sz.NJ)
+	}
+	for _, p := range []*[]V{&c.KType, &c.KCtor, &c.KRec, &c.KRhs, &c.KNPre, &c.KNRec, &c.KNCP, &c.KNCA} {
+		*p = mk(sz.NK)
+	}
+	for _, p := range []*[]V{&c.WKind, &c.WCtor, &c.WU, &c.WM, &c.WW, &c.WN, &c.WPrev, &c.WKeep} {
+		*p = mk(sz.NW)
 	}
 	return c
 }
@@ -105,7 +117,7 @@ func (c *Circuit) Define(api frontend.API) error {
 	tF, tG := newTable(api, c.F), newTable(api, c.G)
 
 	for i := 0; i < sz.NT; i++ {
-		s := onehot(tag[i], 6)
+		s := onehot(tag[i], kernel.NumTags)
 		comp := api.Add(s[kernel.TPi], s[kernel.TLam], s[kernel.TApp])
 		binder := api.Add(s[kernel.TPi], s[kernel.TLam])
 		rng(a[i])
@@ -161,13 +173,13 @@ func (c *Circuit) Define(api frontend.API) error {
 		live := api.Sub(1, skip)
 		tg := tTag.at(t)
 		ta, tb, tgG := tA.at(t), tB.at(t), tG.at(t)
-		s := onehot(tg, 6)
+		s := onehot(tg, kernel.NumTags)
 		api.AssertIsEqual(tG.at(c.IS[k]), 0)
 		// skip: BVar K cannot occur, result is T
 		geIf(skip, c.IK[k], tgG)
 		eqIf(skip, c.IR[k], t)
 		// atoms
-		atom := api.Mul(live, api.Add(s[kernel.TSort], s[kernel.TFVar]))
+		atom := api.Mul(live, api.Add(s[kernel.TSort], s[kernel.TFVar], s[kernel.TConst]))
 		eqIf(atom, c.IR[k], t)
 		isEq := api.IsZero(api.Sub(ta, c.IK[k]))
 		eqIf(api.Mul(live, s[kernel.TBVar]), c.IR[k], api.Select(isEq, c.IS[k], t))
@@ -185,6 +197,67 @@ func (c *Circuit) Define(api frontend.API) error {
 		eqIf(comp, iK.at(c.IC2[k]), api.Add(c.IK[k], binder))
 		eqIf(comp, iS.at(c.IC2[k]), c.IS[k])
 		eqIf(comp, iR.at(c.IC2[k]), tB.at(c.IR[k]))
+	}
+
+	// ---------------- constant table (public) ----------------
+	kType, kCtor, kRec, kRhs := newTable(api, c.KType), newTable(api, c.KCtor), newTable(api, c.KRec), newTable(api, c.KRhs)
+	kNPre, kNRec, kNCP, kNCA := newTable(api, c.KNPre), newTable(api, c.KNRec), newTable(api, c.KNCP), newTable(api, c.KNCA)
+
+	// ---------------- iota walks ----------------
+	wKind, wCtor, wU, wM := newTable(api, c.WKind), newTable(api, c.WCtor), newTable(api, c.WU), newTable(api, c.WM)
+	wW, wN := newTable(api, c.WW), newTable(api, c.WN)
+	for k := 0; k < sz.NW; k++ {
+		s := onehot(c.WKind[k], kernel.NumWKinds)
+		j, u, m, w, n, keep := c.WCtor[k], c.WU[k], c.WM[k], c.WW[k], c.WN[k], c.WKeep[k]
+		api.AssertIsBoolean(keep)
+		nkeep := api.Sub(1, keep)
+		rng(n)
+		uT, uA, uB := tTag.at(u), tA.at(u), tB.at(u)
+		mT, mA, mB := tTag.at(m), tA.at(m), tB.at(m)
+		wT, wA, wB := tTag.at(w), tA.at(w), tB.at(w)
+		rb, ra, cb, ca := s[kernel.WRecBase], s[kernel.WRecArg], s[kernel.WCtorBase], s[kernel.WCtorArg]
+		step := api.Add(ra, cb, ca)
+		ltIf(step, c.WPrev[k], k)
+		pIdx := api.Mul(step, c.WPrev[k])
+		pk, pj, pu, pm, pw, pn := wKind.at(pIdx), wCtor.at(pIdx), wU.at(pIdx), wM.at(pIdx), wW.at(pIdx), wN.at(pIdx)
+		nPre, nRec, nCP := kNPre.at(j), kNRec.at(j), kNCP.at(j)
+		eqIf(step, pj, j)
+		// prev kind ∈ {RecBase, RecArg} resp. {CtorBase, CtorArg}
+		recPrev := api.Add(ra, cb)
+		api.AssertIsEqual(api.Mul(recPrev, api.Sub(pk, kernel.WRecBase), api.Sub(pk, kernel.WRecArg)), 0)
+		api.AssertIsEqual(api.Mul(ca, api.Sub(pk, kernel.WCtorBase), api.Sub(pk, kernel.WCtorArg)), 0)
+		// rec base: U = rec, W = Rhs rec
+		eqIf(rb, kCtor.at(j), 1)
+		eqIf(rb, uT, kernel.TConst)
+		eqIf(rb, uA, kRec.at(j))
+		eqIf(rb, wT, kernel.TApp)
+		eqIf(rb, wA, kRhs.at(j))
+		eqIf(rb, wB, u)
+		eqIf(api.Add(rb, cb), n, 0)
+		// arg steps: N = prev.N + 1; W grows by the argument iff keep
+		arg := api.Add(ra, ca)
+		eqIf(arg, n, api.Add(pn, 1))
+		eqIf(api.Mul(arg, keep), wT, kernel.TApp)
+		eqIf(api.Mul(arg, keep), wA, pw)
+		eqIf(api.Mul(arg, nkeep), w, pw)
+		// rec arg: U = prev.U a, keep ⇔ prev.N < NPre
+		eqIf(ra, uT, kernel.TApp)
+		eqIf(ra, uA, pu)
+		eqIf(api.Mul(ra, keep), wB, uB)
+		rng(api.Mul(ra, keep, api.Sub(nPre, pn, 1)))
+		rng(api.Mul(ra, nkeep, api.Sub(pn, nPre)))
+		// ctor base: prev.N = NRec, M = c, U and W carried
+		eqIf(cb, pn, nRec)
+		eqIf(cb, mT, kernel.TConst)
+		eqIf(cb, mA, j)
+		eqIf(cb, w, pw)
+		eqIf(api.Add(cb, ca), u, pu)
+		// ctor arg: M = prev.M b, keep ⇔ prev.N ≥ NCP
+		eqIf(ca, mT, kernel.TApp)
+		eqIf(ca, mA, pm)
+		eqIf(api.Mul(ca, keep), wB, mB)
+		rng(api.Mul(ca, keep, api.Sub(pn, nCP)))
+		rng(api.Mul(ca, nkeep, api.Sub(nCP, pn, 1)))
 	}
 
 	// ---------------- conversion ----------------
@@ -253,6 +326,16 @@ func (c *Circuit) Define(api frontend.API) error {
 		eqIf(sa, c1b, a2)
 		eqIf(sa, c2a, b1)
 		eqIf(sa, c2b, b2)
+		// iota: T1 = App(U, M), T2 = W for a completed walk
+		si := s[kernel.CIota]
+		wIdx := api.Mul(si, c.CI1[k])
+		wk := wKind.at(wIdx)
+		api.AssertIsEqual(api.Mul(si, api.Sub(wk, kernel.WCtorBase), api.Sub(wk, kernel.WCtorArg)), 0)
+		eqIf(si, wN.at(wIdx), kNCA.at(api.Mul(si, wCtor.at(wIdx))))
+		eqIf(si, g1, kernel.TApp)
+		eqIf(si, a1, wU.at(wIdx))
+		eqIf(si, b1, wM.at(wIdx))
+		eqIf(si, t2, wW.at(wIdx))
 	}
 
 	// ---------------- judgments ----------------
@@ -346,6 +429,15 @@ func (c *Circuit) Define(api frontend.API) error {
 		eqIf(sc, c2ctx, ctx)
 		eqIf(sc, c2s, ty)
 		eqIf(sc, y2T, kernel.TSort)
+		// Const: c.{u} : Type(c)[BVar 0 := Sort u]
+		sk := s[kernel.JConst]
+		eqIf(sk, sT, kernel.TConst)
+		eqIf(sk, tTag.at(c.JV[j]), kernel.TSort)
+		eqIf(sk, tA.at(c.JV[j]), sB)
+		eqIf(sk, i1T, kType.at(api.Mul(sk, sA)))
+		eqIf(sk, i1K, 0)
+		eqIf(sk, i1S, c.JV[j])
+		eqIf(sk, i1R, ty)
 	}
 
 	// ---------------- root ----------------
@@ -382,6 +474,10 @@ func Assign(cert *kernel.Certificate, sz kernel.Sizes) *Circuit {
 		c.JRule[i], c.JCtx[i], c.JSubj[i], c.JTy[i], c.JC1[i], c.JC2[i] = r.Rule, r.Ctx, r.Subj, r.Ty, r.C1, r.C2
 		c.JI1[i], c.JI2[i], c.JX[i], c.JV[i], c.JL[i], c.JCv[i], c.JM[i] = r.I1, r.I2, r.X, r.V, r.L, r.Cv, r.M
 	}
+	for i, r := range cert.Iota {
+		c.WKind[i], c.WCtor[i], c.WU[i], c.WM[i], c.WW[i], c.WN[i], c.WPrev[i], c.WKeep[i] =
+			r.Kind, r.Ctor, r.U, r.M, r.W, r.N, r.Prev, r.Keep
+	}
 	return c
 }
 
@@ -392,4 +488,12 @@ func PublicAssign(c *Circuit, s *kernel.Store, root int, sz kernel.Sizes) {
 		c.PubTag[i], c.PubA[i], c.PubB[i] = n.Tag, n.A, n.B
 	}
 	c.Root = root
+	for i := 0; i < sz.NK; i++ {
+		var k kernel.ConstRow
+		if i < len(s.Consts) {
+			k = s.Consts[i]
+		}
+		c.KType[i], c.KCtor[i], c.KRec[i], c.KRhs[i] = k.Type, k.Ctor, k.Rec, k.Rhs
+		c.KNPre[i], c.KNRec[i], c.KNCP[i], c.KNCA[i] = k.NPre, k.NRec, k.NCP, k.NCA
+	}
 }

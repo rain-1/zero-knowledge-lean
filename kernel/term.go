@@ -1,9 +1,9 @@
 // Package kernel implements the trusted core of zkLean: a locally-nameless
 // Calculus of Constructions with a predicative-over-impredicative universe
 // hierarchy Sort 0 (= Prop) : Sort 1 (= Type) : Sort 2 : ...  — the same
-// universe structure as Lean 4's kernel, minus universe polymorphism,
-// inductive types and definitional unfolding (definitions are expanded at
-// elaboration time).
+// universe structure as Lean 4's kernel, plus inductive types with
+// recursors and ι-reduction, minus universe polymorphism and definitional
+// unfolding (definitions are expanded at elaboration time).
 //
 // Terms are hash-consed into a DAG (Store). Every node has a numeric id, and
 // all children have strictly smaller ids. This is exactly the "term table"
@@ -17,15 +17,17 @@ import (
 
 // Term tags. These numeric values are part of the circuit's relation.
 const (
-	TSort = 0 // A = universe level
-	TBVar = 1 // A = de Bruijn index (bound variable, only inside binders)
-	TFVar = 2 // A = de Bruijn *level* of a context entry (free variable)
-	TPi   = 3 // A = domain, B = body (body binds BVar 0)
-	TLam  = 4 // A = domain, B = body
-	TApp  = 5 // A = function, B = argument
+	TSort   = 0 // A = universe level
+	TBVar   = 1 // A = de Bruijn index (bound variable, only inside binders)
+	TFVar   = 2 // A = de Bruijn *level* of a context entry (free variable)
+	TPi     = 3 // A = domain, B = body (body binds BVar 0)
+	TLam    = 4 // A = domain, B = body
+	TApp    = 5 // A = function, B = argument
+	TConst  = 6 // A = index into the constant table, B = universe level (recursors only)
+	NumTags = 7
 )
 
-var tagNames = []string{"Sort", "BVar", "FVar", "Pi", "Lam", "App"}
+var tagNames = []string{"Sort", "BVar", "FVar", "Pi", "Lam", "App", "Const"}
 
 // Node is one row of the term table.
 //
@@ -41,10 +43,14 @@ type Node struct {
 
 func IsComposite(tag int) bool { return tag == TPi || tag == TLam || tag == TApp }
 
-// Store is a hash-consed term DAG.
+// Store is a hash-consed term DAG together with the constant table of the
+// inductive declarations it was elaborated against (term ids in Consts refer
+// to this store).
 type Store struct {
-	Nodes []Node
-	idx   map[[3]int]int
+	Nodes      []Node
+	Consts     []ConstRow
+	ConstNames []string
+	idx        map[[3]int]int
 	// memo tables for pure operations
 	instMemo  map[[3]int]int
 	closeMemo map[[3]int]int
@@ -67,7 +73,7 @@ func max(a, b int) int {
 
 // Mk returns the id of the node (tag, a, b), creating it if necessary.
 func (s *Store) Mk(tag, a, b int) int {
-	if !IsComposite(tag) {
+	if !IsComposite(tag) && tag != TConst {
 		b = 0
 	}
 	k := [3]int{tag, a, b}
@@ -76,7 +82,7 @@ func (s *Store) Mk(tag, a, b int) int {
 	}
 	n := Node{Tag: tag, A: a, B: b}
 	switch tag {
-	case TSort:
+	case TSort, TConst:
 	case TBVar:
 		n.G = a + 1
 	case TFVar:
@@ -104,12 +110,13 @@ func (s *Store) AppendRaw(n Node) int {
 
 func (s *Store) N(id int) Node { return s.Nodes[id] }
 
-func (s *Store) Sort(u int) int   { return s.Mk(TSort, u, 0) }
-func (s *Store) BVar(i int) int   { return s.Mk(TBVar, i, 0) }
-func (s *Store) FVar(l int) int   { return s.Mk(TFVar, l, 0) }
-func (s *Store) Pi(a, b int) int  { return s.Mk(TPi, a, b) }
-func (s *Store) Lam(a, b int) int { return s.Mk(TLam, a, b) }
-func (s *Store) App(f, a int) int { return s.Mk(TApp, f, a) }
+func (s *Store) Sort(u int) int     { return s.Mk(TSort, u, 0) }
+func (s *Store) BVar(i int) int     { return s.Mk(TBVar, i, 0) }
+func (s *Store) FVar(l int) int     { return s.Mk(TFVar, l, 0) }
+func (s *Store) Pi(a, b int) int    { return s.Mk(TPi, a, b) }
+func (s *Store) Lam(a, b int) int   { return s.Mk(TLam, a, b) }
+func (s *Store) App(f, a int) int   { return s.Mk(TApp, f, a) }
+func (s *Store) Const(k, u int) int { return s.Mk(TConst, k, u) }
 func (s *Store) Apps(f int, as ...int) int {
 	for _, a := range as {
 		f = s.App(f, a)
@@ -127,7 +134,7 @@ func (s *Store) Inst(t, k, v int) int {
 	n := s.Nodes[t]
 	var r int
 	switch n.Tag {
-	case TSort, TFVar:
+	case TSort, TFVar, TConst:
 		r = t
 	case TBVar:
 		if n.A == k {
@@ -156,7 +163,7 @@ func (s *Store) Close(t, lvl, k int) int {
 	n := s.Nodes[t]
 	var r int
 	switch n.Tag {
-	case TSort, TBVar:
+	case TSort, TBVar, TConst:
 		r = t
 	case TFVar:
 		if n.A == lvl {
@@ -173,6 +180,19 @@ func (s *Store) Close(t, lvl, k int) int {
 	return r
 }
 
+// Spine decomposes t = h a1 ... an into its head and arguments.
+func (s *Store) Spine(t int) (int, []int) {
+	var args []int
+	for s.Nodes[t].Tag == TApp {
+		args = append(args, s.Nodes[t].B)
+		t = s.Nodes[t].A
+	}
+	for i, j := 0, len(args)-1; i < j; i, j = i+1, j-1 {
+		args[i], args[j] = args[j], args[i]
+	}
+	return t, args
+}
+
 // Import copies term id from src into s (post-order, deterministic), returning
 // the new id. Used to lay out the public statement canonically.
 func (s *Store) Import(src *Store, id int, memo map[int]int) int {
@@ -186,7 +206,7 @@ func (s *Store) Import(src *Store, id int, memo map[int]int) int {
 		b := s.Import(src, n.B, memo)
 		r = s.Mk(n.Tag, a, b)
 	} else {
-		r = s.Mk(n.Tag, n.A, 0)
+		r = s.Mk(n.Tag, n.A, n.B)
 	}
 	memo[id] = r
 	return r
@@ -247,6 +267,15 @@ func (s *Store) show(b *strings.Builder, id, depth, prec int) {
 		}
 	case TFVar:
 		fmt.Fprintf(b, "f%d", n.A)
+	case TConst:
+		if n.A < len(s.ConstNames) {
+			b.WriteString(s.ConstNames[n.A])
+		} else {
+			fmt.Fprintf(b, "c%d", n.A)
+		}
+		if n.B != 0 {
+			fmt.Fprintf(b, ".{%d}", n.B)
+		}
 	case TPi:
 		paren(0, func() {
 			if s.Nodes[n.B].G == 0 || !s.usesBVar0(n.B) {

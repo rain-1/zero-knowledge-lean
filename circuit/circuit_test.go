@@ -22,7 +22,7 @@ func cert(t *testing.T, name string, sz kernel.Sizes) *kernel.Certificate {
 		t.Fatal(err)
 	}
 	d, _ := env.Lookup(name)
-	c, err := kernel.Certify(env.S, d.Type, d.Value, sz.NP)
+	c, err := kernel.Certify(env.S, d.Type, d.Value, sz)
 	if err != nil {
 		t.Fatal(err)
 	}

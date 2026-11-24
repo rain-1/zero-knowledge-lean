@@ -3,9 +3,9 @@ package kernel
 import "fmt"
 
 // The certifying type checker. It is an ordinary bidirectional checker for
-// the Calculus of Constructions, except that every inference step, every
-// binder opening and every β-conversion step is recorded as a row of the
-// certificate tables.
+// the Calculus of Constructions with inductive constants, except that every
+// inference step, every binder opening and every β/ι-conversion step is
+// recorded as a row of the certificate tables.
 
 type checker struct {
 	s         *Store
@@ -26,38 +26,67 @@ func (e *TypeError) Error() string { return e.Msg }
 
 func (ck *checker) errf(f string, a ...any) error { return &TypeError{fmt.Sprintf(f, a...)} }
 
-// PublicLayout lays out the theorem statement canonically in rows 0..np-1:
-// row 0 is always Prop, then the statement DAG in post-order, then padding.
-// Prover and verifier both call this, so both agree on the public inputs.
-func PublicLayout(src *Store, stmt, np int, memo map[int]int) (*Store, int, error) {
+func newChecker(s *Store) *checker {
+	return &checker{
+		s: s, c: &Certificate{S: s, Ctx: []CtxRow{{0, 0, 0}}},
+		ctxMemo: map[[2]int]int{}, lookMemo: map[[2]int]int{}, instMemo: map[[3]int]int{},
+		reflMemo: map[int]int{}, nfMemo: map[int][2]int{}, inferMemo: map[[2]int]int{},
+		convMemo: map[[3]int]int{}, fuel: 1 << 20,
+	}
+}
+
+// importConsts copies src's constant table (and the terms it refers to) into s.
+func importConsts(s, src *Store, memo map[int]int) {
+	for _, k := range src.Consts {
+		r := k
+		r.Type = s.Import(src, k.Type, memo)
+		if k.Ctor == 1 {
+			r.Rhs = s.Import(src, k.Rhs, memo)
+		}
+		s.Consts = append(s.Consts, r)
+	}
+	s.ConstNames = src.ConstNames
+}
+
+// PublicLayout lays out the public inputs canonically: row 0 is always Prop,
+// then the constant table's terms (types and ι right-hand sides, in constant
+// order), then the statement DAG in post-order, then padding. The constant
+// table is padded to sz.NK rows. Prover and verifier both call this, so both
+// agree on the public inputs.
+func PublicLayout(src *Store, stmt int, sz Sizes, memo map[int]int) (*Store, int, error) {
 	s := NewStore()
 	s.Sort(0)
-	root := s.Import(src, stmt, memo)
-	if len(s.Nodes) > np {
-		return nil, 0, fmt.Errorf("statement has %d DAG nodes; circuit capacity NP=%d", len(s.Nodes), np)
+	if len(src.Consts) > sz.NK {
+		return nil, 0, fmt.Errorf("environment has %d constants; circuit capacity NK=%d", len(src.Consts), sz.NK)
 	}
-	for len(s.Nodes) < np {
+	importConsts(s, src, memo)
+	root := s.Import(src, stmt, memo)
+	if len(s.Nodes) > sz.NP {
+		return nil, 0, fmt.Errorf("statement and inductive declarations have %d DAG nodes; circuit capacity NP=%d", len(s.Nodes), sz.NP)
+	}
+	for len(s.Nodes) < sz.NP {
 		s.AppendRaw(Node{})
+	}
+	// Unused constant rows have type Prop (row 0): at worst they are opaque
+	// propositional atoms, which is a conservative extension.
+	for len(s.Consts) < sz.NK {
+		s.Consts = append(s.Consts, ConstRow{})
 	}
 	return s, root, nil
 }
 
 // Certify type-checks `proof : stmt` (both closed terms in src) and returns the
 // unpadded certificate.
-func Certify(src *Store, stmt, proof, np int) (*Certificate, error) {
+func Certify(src *Store, stmt, proof int, sz Sizes) (*Certificate, error) {
 	memo := map[int]int{}
-	s, root, err := PublicLayout(src, stmt, np, memo)
+	s, root, err := PublicLayout(src, stmt, sz, memo)
 	if err != nil {
 		return nil, err
 	}
 	t := s.Import(src, proof, memo)
-	c := &Certificate{S: s, Root: root, Ctx: []CtxRow{{0, 0, 0}}}
-	ck := &checker{
-		s: s, c: c,
-		ctxMemo: map[[2]int]int{}, lookMemo: map[[2]int]int{}, instMemo: map[[3]int]int{},
-		reflMemo: map[int]int{}, nfMemo: map[int][2]int{}, inferMemo: map[[2]int]int{},
-		convMemo: map[[3]int]int{}, fuel: 1 << 20,
-	}
+	ck := newChecker(s)
+	c := ck.c
+	c.Root = root
 	if s.N(t).F != 0 || s.N(t).G != 0 || s.N(root).F != 0 || s.N(root).G != 0 {
 		return nil, fmt.Errorf("proof and statement must be closed terms")
 	}
@@ -81,19 +110,15 @@ func Certify(src *Store, stmt, proof, np int) (*Certificate, error) {
 func TypeOf(src *Store, t int) (*Store, int, error) {
 	s := NewStore()
 	s.Sort(0)
-	tt := s.Import(src, t, map[int]int{})
-	c := &Certificate{S: s, Ctx: []CtxRow{{0, 0, 0}}}
-	ck := &checker{
-		s: s, c: c,
-		ctxMemo: map[[2]int]int{}, lookMemo: map[[2]int]int{}, instMemo: map[[3]int]int{},
-		reflMemo: map[int]int{}, nfMemo: map[int][2]int{}, inferMemo: map[[2]int]int{},
-		convMemo: map[[3]int]int{}, fuel: 1 << 20,
-	}
+	memo := map[int]int{}
+	importConsts(s, src, memo)
+	tt := s.Import(src, t, memo)
+	ck := newChecker(s)
 	r, err := ck.infer(0, tt)
 	if err != nil {
 		return nil, 0, err
 	}
-	return s, c.Jud[r].Ty, nil
+	return s, ck.c.Jud[r].Ty, nil
 }
 
 // ---- contexts ----
@@ -151,7 +176,7 @@ func (ck *checker) inst(t, k, v int) int {
 		return len(ck.c.Inst) - 1
 	}
 	switch n.Tag {
-	case TSort, TFVar:
+	case TSort, TFVar, TConst:
 		row.R = t
 	case TBVar:
 		if n.A == k {
@@ -228,7 +253,7 @@ func (ck *checker) nf(t int) (int, int, error) {
 	n := s.N(t)
 	var nt, row int
 	switch n.Tag {
-	case TSort, TFVar:
+	case TSort, TFVar, TConst:
 		nt, row = t, ck.refl(t)
 	case TBVar:
 		return 0, 0, ck.errf("internal: nf of non-locally-closed term")
@@ -290,10 +315,58 @@ func (ck *checker) nf(t int) (int, int, error) {
 			} else {
 				row = ck.addConv(ConvRow{Rule: CApp, T1: t, T2: nt, C1: rf, C2: ra})
 			}
+			if ri, red, ok := ck.iota(nt); ok {
+				nr, r3, err := ck.nf(red)
+				if err != nil {
+					return 0, 0, err
+				}
+				nt, row = nr, ck.trans(ck.trans(row, ri), r3)
+			}
 		}
 	}
 	ck.nfMemo[t] = [2]int{nt, row}
 	return nt, row, nil
+}
+
+// iota recognises t = rec a_1 … a_NRec (c b_1 … b_NCA) and records the iota
+// walk and the CIota conversion row t ≡ Rhs(c) rec a_1 … a_NPre b_{NCP+1} … b_NCA.
+func (ck *checker) iota(t int) (row, red int, ok bool) {
+	s := ck.s
+	h, as := s.Spine(s.N(t).A)
+	c, bs := s.Spine(s.N(t).B)
+	hn, cn := s.N(h), s.N(c)
+	if hn.Tag != TConst || cn.Tag != TConst || cn.A >= len(s.Consts) {
+		return 0, 0, false
+	}
+	k := s.Consts[cn.A]
+	if k.Ctor != 1 || k.Rec != hn.A || len(as) != k.NRec || len(bs) != k.NCA {
+		return 0, 0, false
+	}
+	add := func(r IotaRow) int {
+		ck.c.Iota = append(ck.c.Iota, r)
+		return len(ck.c.Iota) - 1
+	}
+	u, w := h, s.App(k.Rhs, h)
+	prev := add(IotaRow{Kind: WRecBase, Ctor: cn.A, U: u, W: w})
+	for i, a := range as {
+		u = s.App(u, a)
+		keep := 0
+		if i < k.NPre {
+			keep, w = 1, s.App(w, a)
+		}
+		prev = add(IotaRow{Kind: WRecArg, Ctor: cn.A, U: u, W: w, N: i + 1, Prev: prev, Keep: keep})
+	}
+	m := c
+	prev = add(IotaRow{Kind: WCtorBase, Ctor: cn.A, U: u, M: m, W: w, Prev: prev})
+	for i, b := range bs {
+		m = s.App(m, b)
+		keep := 0
+		if i >= k.NCP {
+			keep, w = 1, s.App(w, b)
+		}
+		prev = add(IotaRow{Kind: WCtorArg, Ctor: cn.A, U: u, M: m, W: w, N: i + 1, Prev: prev, Keep: keep})
+	}
+	return ck.addConv(ConvRow{Rule: CIota, T1: t, T2: w, I1: prev}), w, true
 }
 
 func (ck *checker) defeq(t1, t2 int) (int, error) {
@@ -340,6 +413,13 @@ func (ck *checker) infer(ctx, t int) (int, error) {
 		row.Rule, row.L, row.Ty = JVar, l, ck.c.Look[l].Ty
 	case TBVar:
 		return 0, ck.errf("internal: loose bound variable")
+	case TConst:
+		if n.A >= len(s.Consts) {
+			return 0, ck.errf("unknown constant c%d", n.A)
+		}
+		v := s.Sort(n.B)
+		i1 := ck.inst(s.Consts[n.A].Type, 0, v)
+		row.Rule, row.V, row.I1, row.Ty = JConst, v, i1, ck.c.Inst[i1].R
 	case TPi:
 		c1, u, err := ck.inferSort(ctx, n.A)
 		if err != nil {
@@ -471,6 +551,7 @@ func (c *Certificate) Pad(sz Sizes) error {
 	need := map[string][2]int{
 		"terms": {len(s.Nodes), sz.NT}, "ctx": {len(c.Ctx) + 1, sz.NX}, "lookups": {len(c.Look), sz.NL},
 		"inst": {len(c.Inst), sz.NI}, "conv": {len(c.Conv), sz.NC}, "judgments": {len(c.Jud), sz.NJ},
+		"iota": {len(c.Iota), sz.NW},
 	}
 	for k, v := range need {
 		if v[0] > v[1] {
@@ -485,6 +566,9 @@ func (c *Certificate) Pad(sz Sizes) error {
 	}
 	for len(c.Look) < sz.NL {
 		c.Look = append(c.Look, LookRow{Ctx: 1, Lvl: c.Ctx[1].Depth - 1, Ty: c.Ctx[1].Type, Base: 1})
+	}
+	for len(c.Iota) < sz.NW {
+		c.Iota = append(c.Iota, IotaRow{Kind: WPad})
 	}
 	for len(c.Inst) < sz.NI {
 		c.Inst = append(c.Inst, InstRow{})

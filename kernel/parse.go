@@ -14,16 +14,23 @@ import (
 //   def      name (x y : A) ... : T := e
 //   theorem  name (x y : A) ... : T := e        -- `lemma` is a synonym
 //   theorem  name ... : T := sorry               -- public statement, no proof
+//   inductive Name (params) : ∀ indices, Sort s where
+//     | ctor (fields) : Name params indices     -- `: T` may be omitted
+//                                               -- when there are no indices
 //
 //   e ::= fun (x : A) (y z : B) => e   |  λ ...      (binder types required)
 //       | ∀ (x : A) (y : B), e         |  ∀ x y : A, e  | forall | Π
 //       | e → e  |  e -> e
 //       | e e                          (application)
 //       | x | Prop | Type | Type n | Sort n | ( e )
+//       | I.rec.{n}                    (recursor eliminating into Sort n)
 //
 // Comments: `-- ...` and `/- ... -/`. Definitions are *transparent macros*:
 // every reference is replaced by the elaborated body, so the kernel term is
 // definition-free and the type checker sees ordinary β-redexes.
+// An inductive declaration `I` adds the constants I, I.ctor… and I.rec (see
+// inductive.go); every argument, including parameters and the motive, is
+// explicit.
 // ---------------------------------------------------------------------------
 
 type tok struct {
@@ -79,7 +86,7 @@ func lex(src string) ([]tok, error) {
 			j := i + w
 			for j < len(src) {
 				r2, w2 := utf8.DecodeRuneInString(src[j:])
-				if !isIdRest(r2) {
+				if !isIdRest(r2) || strings.HasPrefix(src[j:], ".{") {
 					break
 				}
 				j += w2
@@ -88,7 +95,7 @@ func lex(src string) ([]tok, error) {
 			i = j
 		default:
 			matched := false
-			for _, sym := range []string{":=", "=>", "->", "→", "∀", "λ", "Π", "(", ")", ":", ",", "↦"} {
+			for _, sym := range []string{":=", "=>", "->", "→", "∀", "λ", "Π", "(", ")", ":", ",", "↦", ".{", "}", "|"} {
 				if strings.HasPrefix(src[i:], sym) {
 					out = append(out, tok{"sym", sym, i})
 					i += len(sym)
@@ -107,7 +114,7 @@ func lex(src string) ([]tok, error) {
 
 // Decl is an elaborated top-level declaration.
 type Decl struct {
-	Kind      string // "def" or "theorem"
+	Kind      string // "def", "theorem" or "inductive"
 	Name      string
 	Type      int // closed kernel term
 	Value     int // closed kernel term, -1 if `sorry`
@@ -118,10 +125,12 @@ type Decl struct {
 
 // Env is the result of elaborating a file.
 type Env struct {
-	S     *Store
-	Decls []*Decl
-	byNm  map[string]*Decl
-	Src   string
+	S        *Store
+	Decls    []*Decl
+	byNm     map[string]*Decl
+	Src      string
+	constIdx map[string]int
+	recLarge map[int]bool // recursor constant → eliminates into any universe
 }
 
 func (e *Env) Lookup(name string) (*Decl, bool) { d, ok := e.byNm[name]; return d, ok }
@@ -154,7 +163,7 @@ func (ps *parser) expect(s string) error {
 
 var keywords = map[string]bool{
 	"def": true, "theorem": true, "lemma": true, "fun": true, "forall": true,
-	"Prop": true, "Type": true, "Sort": true, "sorry": true,
+	"Prop": true, "Type": true, "Sort": true, "sorry": true, "inductive": true, "where": true,
 }
 
 // Parse elaborates a whole source file.
@@ -163,7 +172,7 @@ func Parse(src string) (*Env, error) {
 	if err != nil {
 		return nil, err
 	}
-	env := &Env{S: NewStore(), byNm: map[string]*Decl{}, Src: src}
+	env := &Env{S: NewStore(), byNm: map[string]*Decl{}, Src: src, constIdx: map[string]int{}, recLarge: map[int]bool{}}
 	ps := &parser{toks: toks, env: env, src: src}
 	for ps.peek().kind != "eof" {
 		if err := ps.decl(); err != nil {
@@ -262,14 +271,22 @@ func (ps *parser) wrap(tag int, bs []binder, body int) int {
 	return body
 }
 
+func (ps *parser) taken(name string) bool {
+	_, d := ps.env.byNm[name]
+	_, c := ps.env.constIdx[name]
+	return d || c
+}
+
 func (ps *parser) decl() error {
 	t := ps.next()
 	kind := t.s
 	switch kind {
 	case "def", "theorem", "lemma":
+	case "inductive":
+		return ps.inductive()
 	default:
 		ps.p--
-		return ps.errf("expected `def` or `theorem`, got %q", t.s)
+		return ps.errf("expected `def`, `theorem` or `inductive`, got %q", t.s)
 	}
 	if kind == "lemma" {
 		kind = "theorem"
@@ -278,7 +295,7 @@ func (ps *parser) decl() error {
 	if nt.kind != "id" || keywords[nt.s] {
 		return ps.errf("expected a name")
 	}
-	if _, dup := ps.env.byNm[nt.s]; dup {
+	if ps.taken(nt.s) {
 		return ps.errf("duplicate declaration %s", nt.s)
 	}
 	sigStart := ps.peek().pos
@@ -323,6 +340,99 @@ func (ps *parser) decl() error {
 	d.BodyEnd = lastTok.pos + len(lastTok.s)
 	ps.env.Decls = append(ps.env.Decls, d)
 	ps.env.byNm[d.Name] = d
+	return nil
+}
+
+// inductive Name (params) : T where | ctor (fields) : U | ...
+func (ps *parser) inductive() error {
+	s := ps.env.S
+	nt := ps.next()
+	if nt.kind != "id" || keywords[nt.s] {
+		return ps.errf("expected a name")
+	}
+	name := nt.s
+	if ps.taken(name) {
+		return ps.errf("duplicate declaration %s", name)
+	}
+	sigStart := ps.peek().pos
+	var bs []binder
+	var err error
+	if ps.is("(") {
+		if bs, err = ps.binders(nil, false); err != nil {
+			return err
+		}
+	}
+	names := make([]string, len(bs))
+	for i, b := range bs {
+		names[i] = b.name
+	}
+	if err := ps.expect(":"); err != nil {
+		return err
+	}
+	ty, err := ps.expr(names)
+	if err != nil {
+		return err
+	}
+	sigEnd := ps.peek().pos
+	if ps.is("where") {
+		ps.next()
+	}
+	former := ps.wrap(TPi, bs, ty)
+	// register the type former so that constructor types can mention it
+	k0 := len(s.Consts)
+	s.Consts = append(s.Consts, ConstRow{Type: former})
+	s.ConstNames = append(s.ConstNames, name)
+	ps.env.constIdx[name] = k0
+	var cnames []string
+	var ctys []int
+	for ps.is("|") {
+		ps.next()
+		ct := ps.next()
+		if ct.kind != "id" || keywords[ct.s] {
+			return ps.errf("expected a constructor name")
+		}
+		cname := name + "." + ct.s
+		if ps.taken(cname) {
+			return ps.errf("duplicate declaration %s", cname)
+		}
+		for _, c := range cnames {
+			if c == cname {
+				return ps.errf("duplicate constructor %s", cname)
+			}
+		}
+		var cbs []binder
+		if ps.is("(") {
+			if cbs, err = ps.binders(names, false); err != nil {
+				return err
+			}
+		}
+		inner := append([]string{}, names...)
+		for _, b := range cbs {
+			inner = append(inner, b.name)
+		}
+		var res int
+		if ps.is(":") {
+			ps.next()
+			if res, err = ps.expr(inner); err != nil {
+				return err
+			}
+		} else {
+			res = s.Const(k0, 0)
+			for i := range bs {
+				res = s.App(res, s.BVar(len(inner)-1-i))
+			}
+		}
+		cnames = append(cnames, cname)
+		ctys = append(ctys, ps.wrap(TPi, bs, ps.wrap(TPi, cbs, res)))
+	}
+	if err := ps.env.addInductive(k0, len(bs), cnames, ctys); err != nil {
+		return ps.errf("inductive %s: %v", name, err)
+	}
+	sig := strings.Join(strings.Fields(ps.src[sigStart:sigEnd]), " ")
+	d := &Decl{Kind: "inductive", Name: name, Type: s.Consts[k0].Type, Value: -1, Signature: sig}
+	d.BodyStart, d.BodyEnd = ps.toks[ps.p-1].pos, ps.toks[ps.p-1].pos
+	ps.env.Decls = append(ps.env.Decls, d)
+	ps.env.byNm[name] = d
 	return nil
 }
 
@@ -443,7 +553,35 @@ func (ps *parser) atom(locals []string) (int, error) {
 			return s.BVar(len(locals) - 1 - i), nil
 		}
 	}
+	if k, ok := ps.env.constIdx[t.s]; ok {
+		lvl, explicit := 0, false
+		if ps.is(".{") {
+			ps.next()
+			if ps.peek().kind != "num" {
+				return 0, ps.errf("expected a numeric universe level")
+			}
+			lvl, _ = strconv.Atoi(ps.next().s)
+			explicit = true
+			if err := ps.expect("}"); err != nil {
+				return 0, err
+			}
+		}
+		large, isRec := ps.env.recLarge[k]
+		switch {
+		case explicit && !isRec:
+			return 0, ps.errf("only recursors take a universe level, not %s", t.s)
+		case isRec && large && !explicit:
+			return 0, ps.errf("%s eliminates into any universe: write %s.{u}, e.g. %s.{0} for proofs by induction, %s.{1} to compute into Type",
+				t.s, t.s, t.s, t.s)
+		case isRec && !large && lvl != 0:
+			return 0, ps.errf("%s only eliminates into Prop", t.s)
+		}
+		return s.Const(k, lvl), nil
+	}
 	if d, ok := ps.env.byNm[t.s]; ok {
+		if d.Kind == "inductive" {
+			return s.Const(ps.env.constIdx[t.s], 0), nil
+		}
 		if d.Value < 0 {
 			return 0, ps.errf("%s has no body (sorry) and cannot be unfolded", t.s)
 		}
