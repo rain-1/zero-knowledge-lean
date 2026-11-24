@@ -1,5 +1,8 @@
 # zkLean
 
+<img width="2105" height="1257" alt="image" src="https://github.com/user-attachments/assets/5407600f-1bba-41ae-b54b-ee5e7a22dd7b" />
+
+
 Zero-knowledge proofs of theoremhood for a Lean-style dependent type theory.
 
 You write theorems and proofs in a Lean subset. zkLean produces a 196-byte
